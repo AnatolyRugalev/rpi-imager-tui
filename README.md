@@ -2,6 +2,8 @@
 
 A Terminal User Interface for Raspberry Pi Imager.
 
+![Screenshot](screenshots/1.png)
+
 ## Quick Start
 
 Run the following command to install and start the application:

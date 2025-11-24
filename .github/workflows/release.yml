@@ -76,3 +76,4 @@ jobs:
         with:
           files: artifacts/*
           token: ${{ secrets.GH_TOKEN_RELEASE }}
+          generate_release_notes: true
