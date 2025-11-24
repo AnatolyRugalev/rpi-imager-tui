@@ -5,14 +5,11 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-upload:
+  build:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
@@ -49,8 +46,31 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/rpi-imager-tui ${{ matrix.asset_name }}
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ matrix.asset_name }}
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List Artifacts
+        run: ls -R artifacts
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
