@@ -55,6 +55,7 @@ enum CurrentView {
     StorageSelection,
     Customization,
     WriteConfirmation,
+    Authenticating,
     Writing,
     AbortConfirmation,
     Finished,
@@ -80,6 +81,7 @@ struct App {
     pub write_phase: Option<WritingPhase>,
     pub write_task: Option<tokio::task::JoinHandle<()>>,
     pub abort_handle: Option<tokio::task::AbortHandle>,
+    pub worker_args: Option<Vec<String>>,
 
     // Customization
     pub customization_options: CustomizationOptions,
@@ -117,6 +119,7 @@ impl App {
             write_phase: None,
             write_task: None,
             abort_handle: None,
+            worker_args: None,
             customization_options: CustomizationOptions::load(),
             customization_ui: CustomizationUiState::default(),
             customization_menu_state: ListState::default(),
@@ -394,103 +397,42 @@ impl App {
         self.drive_list_state.select(Some(i));
     }
 
-    fn start_writing(&mut self, tx: mpsc::Sender<AppMessage>) {
-        self.current_view = CurrentView::Writing;
-        self.write_progress = 0.0;
-        self.verify_progress = 0.0;
-        self.write_phase = Some(WritingPhase::Writing);
-        self.write_status = "Requesting privileges...".to_string();
-
+    fn start_writing(&mut self, _tx: mpsc::Sender<AppMessage>) {
         if let (Some(os), Some(drive)) = (self.selected_os.clone(), self.selected_drive.clone()) {
             let options = self.customization_options.clone();
 
-            let handle = tokio::spawn(async move {
-                // Prepare arguments
-                let exe = std::env::current_exe().unwrap_or_else(|_| "rpi-imager-tui".into());
+            // Prepare arguments
+            let exe = std::env::current_exe().unwrap_or_else(|_| "rpi-imager-tui".into());
 
-                let options_json = serde_json::to_string(&options).unwrap_or_default();
-                let options_b64 = base64::engine::general_purpose::STANDARD.encode(options_json);
+            let options_json = serde_json::to_string(&options).unwrap_or_default();
+            let options_b64 = base64::engine::general_purpose::STANDARD.encode(options_json);
 
-                // Use pkexec for privilege elevation
-                // Fallback to sudo could be added here if pkexec is missing
-                let mut cmd = Command::new("pkexec");
-                cmd.arg(exe)
-                    .arg("--worker")
-                    .arg("--device")
-                    .arg(drive.name)
-                    .arg("--options")
-                    .arg(options_b64);
+            let mut args = vec![
+                exe.to_string_lossy().to_string(),
+                "--worker".to_string(),
+                "--device".to_string(),
+                drive.name.clone(),
+                "--options".to_string(),
+                options_b64,
+            ];
 
-                if let Some(url) = os.url {
-                    cmd.arg("--image").arg(url);
-                }
-                if let Some(hash) = os.extract_sha256 {
-                    cmd.arg("--sha256").arg(hash);
-                }
-                if let Some(size) = os.extract_size {
-                    cmd.arg("--size").arg(size.to_string());
-                }
+            if let Some(url) = os.url {
+                args.push("--image".to_string());
+                args.push(url.clone());
+            }
+            if let Some(hash) = os.extract_sha256 {
+                args.push("--sha256".to_string());
+                args.push(hash.clone());
+            }
+            if let Some(size) = os.extract_size {
+                args.push("--size".to_string());
+                args.push(size.to_string());
+            }
 
-                // Setup pipes
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-
-                let mut child = match cmd.spawn() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx
-                            .send(AppMessage::WriteError(format!(
-                                "Failed to spawn privileged process: {}",
-                                e
-                            )))
-                            .await;
-                        return;
-                    }
-                };
-
-                let stdout = child.stdout.take().expect("Failed to open stdout");
-                let mut reader = tokio::io::BufReader::new(stdout).lines();
-
-                while let Ok(Some(line)) = reader.next_line().await {
-                    if let Ok(msg) = serde_json::from_str::<worker::WorkerMessage>(&line) {
-                        let app_msg = match msg {
-                            worker::WorkerMessage::Progress(p) => AppMessage::WriteProgress(p),
-                            worker::WorkerMessage::VerifyProgress(p) => {
-                                AppMessage::VerifyProgress(p)
-                            }
-                            worker::WorkerMessage::Status(s) => AppMessage::WriteStatus(s),
-                            worker::WorkerMessage::Phase(p) => {
-                                AppMessage::WritingPhase(match p.as_str() {
-                                    "Verifying" => WritingPhase::Verifying,
-                                    _ => WritingPhase::Writing,
-                                })
-                            }
-                            worker::WorkerMessage::Error(e) => AppMessage::WriteError(e),
-                            worker::WorkerMessage::Finished => AppMessage::WriteFinished,
-                        };
-                        let _ = tx.send(app_msg).await;
-                    }
-                }
-
-                // Check exit status
-                if let Ok(status) = child.wait().await {
-                    if !status.success() {
-                        // If we haven't received a more specific error
-                        let _ = tx
-                            .send(AppMessage::WriteError(format!(
-                                "Worker process exited with code {}",
-                                status.code().unwrap_or(-1)
-                            )))
-                            .await;
-                    }
-                }
-            });
-
-            self.abort_handle = Some(handle.abort_handle());
-            self.write_task = Some(handle);
+            self.worker_args = Some(args);
+            self.current_view = CurrentView::Authenticating;
         }
     }
-
     fn abort_writing(&mut self) {
         if let Some(handle) = &self.abort_handle {
             handle.abort();
@@ -646,13 +588,117 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(
+async fn run_app<B: Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     rx: &mut mpsc::Receiver<AppMessage>,
     tx: mpsc::Sender<AppMessage>,
 ) -> io::Result<()> {
     loop {
+        // Handle Authentication / Worker Spawning
+        if let Some(args) = app.worker_args.take() {
+            // Suspend UI
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+
+            // Spawn Process
+            // We prioritize sudo for TUI/CLI usage as it is more standard for terminal environments.
+            let mut cmd = Command::new("sudo");
+            cmd.args(&args);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::inherit()); // Allow prompt to show
+            cmd.stdin(std::process::Stdio::inherit()); // Allow input
+            let spawn_result = match cmd.spawn() {
+                Ok(c) => Ok(c),
+                Err(e) => {
+                    // Fallback to pkexec if sudo is missing or fails to spawn
+                    let mut cmd = Command::new("pkexec");
+                    cmd.args(&args);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::inherit());
+                    cmd.stdin(std::process::Stdio::inherit());
+                    cmd.spawn().map_err(|_| e) // Return original error if fallback also fails
+                }
+            };
+
+            // Restore UI
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            )?;
+            enable_raw_mode()?;
+
+            match spawn_result {
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
+                        app.current_view = CurrentView::Writing;
+                        app.write_status = "Starting worker...".to_string();
+
+                        let tx_clone = tx.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut reader = tokio::io::BufReader::new(stdout).lines();
+                            while let Ok(Some(line)) = reader.next_line().await {
+                                if let Ok(msg) =
+                                    serde_json::from_str::<worker::WorkerMessage>(&line)
+                                {
+                                    let app_msg = match msg {
+                                        worker::WorkerMessage::Progress(p) => {
+                                            AppMessage::WriteProgress(p)
+                                        }
+                                        worker::WorkerMessage::VerifyProgress(p) => {
+                                            AppMessage::VerifyProgress(p)
+                                        }
+                                        worker::WorkerMessage::Status(s) => {
+                                            AppMessage::WriteStatus(s)
+                                        }
+                                        worker::WorkerMessage::Phase(p) => {
+                                            AppMessage::WritingPhase(match p.as_str() {
+                                                "Verifying" => WritingPhase::Verifying,
+                                                _ => WritingPhase::Writing,
+                                            })
+                                        }
+                                        worker::WorkerMessage::Error(e) => {
+                                            AppMessage::WriteError(e)
+                                        }
+                                        worker::WorkerMessage::Finished => {
+                                            AppMessage::WriteFinished
+                                        }
+                                    };
+                                    let _ = tx_clone.send(app_msg).await;
+                                }
+                            }
+                            // Check exit status
+                            if let Ok(status) = child.wait().await {
+                                if !status.success() {
+                                    let _ = tx_clone
+                                        .send(AppMessage::WriteError(format!(
+                                            "Worker process exited with code {}",
+                                            status.code().unwrap_or(-1)
+                                        )))
+                                        .await;
+                                }
+                            }
+                        });
+                        app.abort_handle = Some(handle.abort_handle()); // Note: this abort handle kills the reader, not the child.
+                        app.write_task = Some(handle);
+                    } else {
+                        app.error_message = Some("Failed to capture stdout of worker".to_string());
+                        app.current_view = CurrentView::StorageSelection;
+                    }
+                }
+                Err(e) => {
+                    app.error_message = Some(format!("Failed to spawn privileged process: {}", e));
+                    app.current_view = CurrentView::StorageSelection;
+                }
+            }
+        }
+
         // Check for updates from fetch task or write task
         match rx.try_recv() {
             Ok(AppMessage::OsListLoaded(result)) => match result {
@@ -901,6 +947,9 @@ async fn run_app<B: Backend>(
                             }
                             _ => {}
                         },
+                        CurrentView::Authenticating => {
+                            // Ignore all input while authenticating
+                        }
                     }
                 }
             }
@@ -981,6 +1030,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         }
         CurrentView::Customization => "Edit image customization options.",
         CurrentView::WriteConfirmation => "Confirm write operation.",
+        CurrentView::Authenticating => {
+            "Authenticating... Please check terminal for password prompt."
+        }
         CurrentView::Writing => app.write_status.as_str(),
         CurrentView::AbortConfirmation => match app.write_phase {
             Some(WritingPhase::Verifying) => "Skip verification?",
@@ -1019,6 +1071,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             }
         }
         CurrentView::WriteConfirmation => "y/Enter: Confirm | n/Esc: Cancel | q: Quit",
+        CurrentView::Authenticating => "Please wait...",
         CurrentView::Writing => "Esc: Cancel/Skip",
         CurrentView::AbortConfirmation => "y/Enter: Confirm | n/Esc: Continue",
         CurrentView::Finished => "Enter/Esc: Done | q: Quit",
@@ -1443,6 +1496,43 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .style(Style::default().fg(Color::White))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(p, horizontal_layout[1]);
+        }
+        CurrentView::Authenticating => {
+            let text = vec![
+                Line::from(Span::styled(
+                    "Requesting Privileges...",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::raw("Please enter your password if prompted.")),
+            ];
+
+            let p = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Authentication")
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .style(Style::default().fg(Color::White))
+                .alignment(ratatui::layout::Alignment::Center);
+
+            // Re-use layout logic from others or simplify
+            let vertical_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(
+                    [
+                        Constraint::Min(1),
+                        Constraint::Length(5),
+                        Constraint::Min(1),
+                    ]
+                    .as_ref(),
+                )
+                .split(content_chunks[1]);
+
+            f.render_widget(p, vertical_layout[1]);
         }
         CurrentView::Writing => {
             let vertical_layout = Layout::default()
