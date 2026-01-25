@@ -150,150 +150,221 @@ impl CustomizationOptions {
     pub fn generate_firstrun_script(&self) -> String {
         let mut script = String::from("#!/bin/bash\n");
 
-        // Better safety
-        script.push_str("set -e\n");
+        // Better safety (disable for some commands that might fail harmlessly)
+        script.push_str("set +e\n");
 
-        // Wait for system to settle slightly?
-        // script.push_str("sleep 5\n");
+        // 1. Hostname
+        if !self.hostname.is_empty() {
+            script.push_str(&format!(
+                "CURRENT_HOSTNAME=$(cat /etc/hostname | tr -d \" \\t\\n\\r\")\n\
+                 if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then\n\
+                     /usr/lib/raspberrypi-sys-mods/imager_custom set_hostname {}\n\
+                 else\n\
+                     echo {} > /etc/hostname\n\
+                     sed -i \"s/127.0.1.1.*$CURRENT_HOSTNAME/127.0.1.1\\t{}/g\" /etc/hosts\n\
+                 fi\n",
+                shell_escape(&self.hostname),
+                shell_escape(&self.hostname),
+                self.hostname
+            ));
+        }
 
-        // 1. User Account
-        // Modern RPi OS might not have 'pi' user by default.
-        // We attempt to create the user if it doesn't exist, or update password if it does.
+        // Determine first user (uid 1000) and home
+        script.push_str("FIRSTUSER=$(getent passwd 1000 | cut -d: -f1)\n");
+        script.push_str("FIRSTUSERHOME=$(getent passwd 1000 | cut -d: -f6)\n");
+
+        // 2. SSH
+        if self.ssh_enabled {
+            if !self.ssh_public_keys.is_empty() {
+                script.push_str("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then\n");
+                script.push_str(&format!(
+                    "   /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh -k '{}'\n",
+                    self.ssh_public_keys
+                ));
+                script.push_str("else\n");
+                script.push_str("   install -o \"$FIRSTUSER\" -m 700 -d \"$FIRSTUSERHOME/.ssh\"\n");
+                script.push_str("   cat > \"$FIRSTUSERHOME/.ssh/authorized_keys\" <<'EOF'\n");
+                script.push_str(&self.ssh_public_keys);
+                script.push_str("\nEOF\n");
+                script.push_str(
+                    "   chown \"$FIRSTUSER:$FIRSTUSER\" \"$FIRSTUSERHOME/.ssh/authorized_keys\"\n",
+                );
+                script.push_str("   chmod 600 \"$FIRSTUSERHOME/.ssh/authorized_keys\"\n");
+
+                if !self.ssh_password_auth {
+                    script.push_str("   echo 'PasswordAuthentication no' >>/etc/ssh/sshd_config\n");
+                }
+
+                script.push_str("   systemctl enable ssh\n");
+                script.push_str("fi\n");
+            } else if self.ssh_password_auth {
+                script.push_str("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then\n");
+                script.push_str("   /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh\n");
+                script.push_str("else\n");
+                script.push_str("   systemctl enable ssh\n");
+                script.push_str("fi\n");
+            }
+        }
+
+        // 3. User Account
+
         let user = &self.user_name;
+
         let pwd = self.password.as_deref().unwrap_or("");
 
         if !user.is_empty() && !pwd.is_empty() {
-            // Check if user exists
-            script.push_str(&format!("if id \"{}\" &>/dev/null; then\n", user));
-            // User exists, update password
+            let pwd_hash = hash_password(pwd);
+
+            script.push_str("if [ -f /usr/lib/userconf-pi/userconf ]; then\n");
+
             script.push_str(&format!(
-                "    echo \"{}:{}\" | chpasswd\n",
-                user,
-                shell_escape(pwd) // chpasswd takes plaintext on stdin usually
+                "   /usr/lib/userconf-pi/userconf {} {}\n",
+                shell_escape(user),
+                shell_escape(&pwd_hash)
             ));
+
             script.push_str("else\n");
-            // Create user
-            script.push_str(&format!("    useradd -m -s /bin/bash \"{}\"\n", user));
+
+            // Legacy/Manual fallback
+
             script.push_str(&format!(
-                "    echo \"{}:{}\" | chpasswd\n",
-                user,
-                shell_escape(pwd)
+                "   echo \"$FIRSTUSER:{}\" | chpasswd -e\n",
+                shell_escape(&pwd_hash)
             ));
-            // Add to sudoers/groups
+
+            script.push_str(&format!("   if [ \"$FIRSTUSER\" != \"{}\" ]; then\n", user));
+
+            script.push_str(&format!("      usermod -l \"{}\" \"$FIRSTUSER\"\n", user));
             script.push_str(&format!(
-                "    usermod -aG sudo,video,audio,gpio,plugdev,netdev,dialout,users \"{}\"\n",
+                "      usermod -m -d \"/home/{}\" \"{}\"\n",
+                user, user
+            ));
+            script.push_str(&format!("      groupmod -n \"{}\" \"$FIRSTUSER\"\n", user));
+
+            // Fix autologin and sudoers
+            script.push_str(
+                "      if grep -q \"^autologin-user=\" /etc/lightdm/lightdm.conf ; then\n",
+            );
+            script.push_str(&format!(
+                "         sed /etc/lightdm/lightdm.conf -i -e \"s/^autologin-user=.*/autologin-user={}/\"\n",
                 user
             ));
+            script.push_str("      fi\n");
+
+            script.push_str(
+                "      if [ -f /etc/systemd/system/getty@tty1.service.d/autologin.conf ]; then\n",
+            );
+            script.push_str(&format!(
+                "         sed /etc/systemd/system/getty@tty1.service.d/autologin.conf -i -e \"s/$FIRSTUSER/{}/\"\n",
+                user
+            ));
+            script.push_str("      fi\n");
+
+            script.push_str("      if [ -f /etc/sudoers.d/010_pi-nopasswd ]; then\n");
+            script.push_str(&format!(
+                "         sed -i \"s/^$FIRSTUSER /{} /\" /etc/sudoers.d/010_pi-nopasswd\n",
+                user
+            ));
+            script.push_str("      fi\n");
+            script.push_str("   fi\n");
             script.push_str("fi\n");
         }
 
-        // 2. Hostname
-        if !self.hostname.is_empty() {
-            script.push_str(&format!(
-                "CURRENT_HOSTNAME=$(cat /etc/hostname)\n\
-                 if [ \"$CURRENT_HOSTNAME\" != \"{}\" ]; then\n\
-                     echo \"{}\" > /etc/hostname\n\
-                     sed -i \"s/127.0.1.1.*$CURRENT_HOSTNAME/127.0.1.1\\t{}/g\" /etc/hosts\n\
-                     hostnamectl set-hostname \"{}\"\n\
-                 fi\n",
-                self.hostname, self.hostname, self.hostname, self.hostname
-            ));
-        }
-
-        // 3. Locale / Timezone / Keyboard
-        if self.timezone != "Europe/London" {
-            script.push_str(&format!("timedatectl set-timezone \"{}\"\n", self.timezone));
-            script.push_str(&format!(
-                "rm /etc/localtime\n\
-                  echo \"{}\" > /etc/timezone\n\
-                  dpkg-reconfigure -f noninteractive tzdata\n",
-                self.timezone
-            ));
-        }
-
-        // Keyboard layout is tricky in headless, usually handled by /etc/default/keyboard
-        if self.keyboard_layout != "gb" {
-            script.push_str(&format!(
-                "sed -i 's/XKBLAYOUT=\".*\"/XKBLAYOUT=\"{}\"/' /etc/default/keyboard\n\
-                  setupcon || true\n",
-                self.keyboard_layout
-            ));
-        }
-
-        // Locale generation
-        // e.g. en_US.UTF-8
-        if self.locale != "en_GB.UTF-8" {
-            // Uncomment the locale in /etc/locale.gen
-            script.push_str(&format!(
-                "sed -i 's/^# *{} /{} /' /etc/locale.gen\n",
-                regex_escape(&self.locale),
-                self.locale
-            ));
-            script.push_str("locale-gen\n");
-            script.push_str(&format!("update-locale LANG={}\n", self.locale));
-        }
-
-        // 4. SSH
-        if self.ssh_enabled {
-            script.push_str("systemctl enable ssh\n");
-            script.push_str("systemctl start ssh\n");
-
-            if !self.ssh_password_auth {
-                // Disable password auth
-                script.push_str("sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config\n");
-                script.push_str("sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config\n");
-            }
-
-            if !self.ssh_public_keys.is_empty() {
-                let home_dir = if user == "root" {
-                    "/root".to_string()
-                } else {
-                    format!("/home/{}", user)
-                };
-                script.push_str(&format!("mkdir -p {}/.ssh\n", home_dir));
-                script.push_str(&format!(
-                    "echo \"{}\" >> {}/.ssh/authorized_keys\n",
-                    self.ssh_public_keys, home_dir
-                ));
-                script.push_str(&format!("chown -R {}:{} {}/.ssh\n", user, user, home_dir));
-                script.push_str(&format!("chmod 700 {}/.ssh\n", home_dir));
-                script.push_str(&format!("chmod 600 {}/.ssh/authorized_keys\n", home_dir));
-            }
-        }
-
-        // 5. WiFi
-        // We write wpa_supplicant.conf
+        // 4. WiFi
         if !self.wifi_ssid.is_empty() {
             let scan_ssid = if self.wifi_hidden { "scan_ssid=1" } else { "" };
+
+            script.push_str("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then\n");
+            let hidden_flag = if self.wifi_hidden { "-h" } else { "" };
             script.push_str(&format!(
-                "cat > /etc/wpa_supplicant/wpa_supplicant.conf <<EOF\n\
-                ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n\
-                update_config=1\n\
-                country={}\n\
-                network={{\n\
-                    ssid=\"{}\"\n\
-                    psk=\"{}\"\n\
-                    {}\n\
-                }}\nEOF\n",
-                self.wifi_country, self.wifi_ssid, self.wifi_password, scan_ssid
+                "   /usr/lib/raspberrypi-sys-mods/imager_custom set_wlan {} {} {} {}\n",
+                hidden_flag,
+                shell_escape(&self.wifi_ssid),
+                shell_escape(&self.wifi_password),
+                shell_escape(&self.wifi_country)
             ));
-            // Ensure permissions
-            script.push_str("chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf\n");
+            script.push_str("else\n");
+
+            script.push_str("cat >/etc/wpa_supplicant/wpa_supplicant.conf <<'WPAEOF'\n");
+            if !self.wifi_country.is_empty() {
+                script.push_str(&format!("country={}\n", self.wifi_country));
+            }
+            script.push_str("ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n");
+            script.push_str("update_config=1\n");
+            script.push_str("network={\n");
+            script.push_str(&format!("    ssid=\"{}\"\n", self.wifi_ssid)); // Simple quoting for now
+            script.push_str(&format!("    psk=\"{}\"\n", self.wifi_password));
+            script.push_str(&format!("    {}\n", scan_ssid));
+            script.push_str("}\n");
+            script.push_str("WPAEOF\n");
+
+            script.push_str("   chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf\n");
+            script.push_str("   rfkill unblock wifi || true\n");
+            script.push_str("   for filename in /var/lib/systemd/rfkill/*:wlan ; do\n");
+            script.push_str("       echo 0 > $filename\n");
+            script.push_str("   done\n");
+            script.push_str("fi\n");
+        } else if !self.wifi_country.is_empty() {
             script.push_str("rfkill unblock wifi || true\n");
-            // Restart networking might be needed, but usually reboot handles it.
+            script.push_str("for filename in /var/lib/systemd/rfkill/*:wlan ; do\n");
+            script.push_str("  echo 0 > $filename\n");
+            script.push_str("done\n");
         }
 
-        // Clean up self
-        // script.push_str("rm -f /boot/firstrun.sh\n");
-        // Remove the cmdline patch? That's harder from within.
-        // RPi Imager's method (systemd.run) is ephemeral if we only append to cmdline for one boot?
-        // Actually systemd.run in cmdline persists until cmdline is edited back.
-        // But usually we just leave it or let the user fix it.
-        // Ideally, we would revert cmdline.txt here.
-        script.push_str("sed -i 's/ systemd.run=\\/boot\\/firstrun.sh//g' /boot/cmdline.txt\n");
-        script.push_str("sed -i 's/ systemd.run_success_action=reboot//g' /boot/cmdline.txt\n");
-        script
-            .push_str("sed -i 's/ systemd.unit=kernel-command-line.target//g' /boot/cmdline.txt\n");
+        // 5. Locale / Timezone / Keyboard
+        if !self.keyboard_layout.is_empty() || !self.timezone.is_empty() || !self.locale.is_empty()
+        {
+            script.push_str("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then\n");
+            if !self.keyboard_layout.is_empty() {
+                script.push_str(&format!(
+                    "   /usr/lib/raspberrypi-sys-mods/imager_custom set_keymap {}\n",
+                    shell_escape(&self.keyboard_layout)
+                ));
+            }
+            if !self.timezone.is_empty() {
+                script.push_str(&format!(
+                    "   /usr/lib/raspberrypi-sys-mods/imager_custom set_timezone {}\n",
+                    shell_escape(&self.timezone)
+                ));
+            }
+            script.push_str("else\n");
+
+            // Fallback
+            if !self.timezone.is_empty() {
+                script.push_str("   rm -f /etc/localtime\n");
+                script.push_str(&format!("   echo \"{}\" >/etc/timezone\n", self.timezone));
+                script.push_str("   dpkg-reconfigure -f noninteractive tzdata\n");
+            }
+
+            if !self.keyboard_layout.is_empty() {
+                script.push_str("cat >/etc/default/keyboard <<'KBEOF'\n");
+                script.push_str("XKBMODEL=\"pc105\"\n");
+                script.push_str(&format!("XKBLAYOUT=\"{}\"\n", self.keyboard_layout));
+                script.push_str("XKBVARIANT=\"\"\n");
+                script.push_str("XKBOPTIONS=\"\"\n");
+                script.push_str("\n");
+                script.push_str("KBEOF\n");
+                script.push_str("   dpkg-reconfigure -f noninteractive keyboard-configuration\n");
+            }
+
+            // Locale generation (from previous implementation, compatible)
+            if self.locale != "en_GB.UTF-8" {
+                script.push_str(&format!(
+                    "sed -i 's/^# *{} /{} /' /etc/locale.gen\n",
+                    regex_escape(&self.locale),
+                    self.locale
+                ));
+                script.push_str("locale-gen\n");
+                script.push_str(&format!("update-locale LANG={}\n", self.locale));
+            }
+
+            script.push_str("fi\n");
+        }
+
+        // Cleanup
+        script.push_str("rm -f /boot/firstrun.sh\n");
+        script.push_str("sed -i 's| systemd.run.*||g' /boot/cmdline.txt\n");
+        script.push_str("exit 0\n");
 
         script
     }
@@ -305,4 +376,8 @@ fn shell_escape(s: &str) -> String {
 
 fn regex_escape(s: &str) -> String {
     s.replace(".", "\\.")
+}
+
+fn hash_password(password: &str) -> String {
+    pwhash::sha512_crypt::hash(password).unwrap_or_else(|_| "".to_string())
 }
