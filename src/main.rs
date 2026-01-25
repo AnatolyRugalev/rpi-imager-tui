@@ -1,6 +1,7 @@
 mod customization;
 mod drivelist;
 mod os_list;
+mod post_process;
 mod writer;
 
 use std::{error::Error, io};
@@ -390,8 +391,9 @@ impl App {
         self.write_status = "Starting...".to_string();
 
         if let (Some(os), Some(drive)) = (self.selected_os.clone(), self.selected_drive.clone()) {
+            let options = self.customization_options.clone();
             let handle = tokio::spawn(async move {
-                match crate::writer::write_image(os, drive, tx.clone()).await {
+                match crate::writer::write_image(os, drive, options, tx.clone()).await {
                     Ok(_) => {}
                     Err(e) => {
                         let _ = tx.send(AppMessage::WriteError(e.to_string())).await;
@@ -441,6 +443,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create App
     let mut app = App::new();
+
+    // Check for local image argument
+    let args: Vec<String> = std::env::args().collect();
+    for arg in args.iter().skip(1) {
+        if !arg.starts_with("--") {
+            // Assume this is an image path
+            let path = std::path::Path::new(arg);
+            let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let name = abs_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Custom Image".to_string());
+
+            let item = OsListItem {
+                name: name.clone(),
+                description: format!("Local Image: {}", abs_path.display()),
+                url: Some(abs_path.to_string_lossy().to_string()),
+                icon: None,
+                extract_size: None,
+                extract_sha256: None,
+                release_date: None,
+                subitems: Vec::new(),
+                // Defaults for missing fields
+                random: false,
+                image_download_size: None,
+                image_download_sha256: None,
+                init_format: None,
+                devices: Vec::new(),
+                capabilities: Vec::new(),
+                website: None,
+                tooltip: None,
+                architecture: None,
+                enable_rpi_connect: false,
+            };
+
+            app.selected_os = Some(item);
+            app.current_view = CurrentView::StorageSelection;
+            app.refresh_drives();
+            break;
+        }
+    }
 
     // Create a channel to communicate between the async fetch and the sync UI loop
     let (tx, mut rx) = mpsc::channel::<AppMessage>(100);

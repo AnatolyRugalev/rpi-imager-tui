@@ -1,5 +1,7 @@
+use crate::customization::CustomizationOptions;
 use crate::drivelist::Drive;
 use crate::os_list::OsListItem;
+use crate::post_process::apply_customization;
 use crate::{AppMessage, WritingPhase};
 use anyhow::{Context, Result, anyhow};
 use async_compression::tokio::bufread::{GzipDecoder, XzDecoder, ZstdDecoder};
@@ -13,7 +15,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader,
 use tokio::sync::mpsc;
 use tokio_util::io::StreamReader;
 
-pub async fn write_image(os: OsListItem, drive: Drive, tx: mpsc::Sender<AppMessage>) -> Result<()> {
+pub async fn write_image(
+    os: OsListItem,
+    drive: Drive,
+    options: CustomizationOptions,
+    tx: mpsc::Sender<AppMessage>,
+) -> Result<()> {
     let url = os
         .url
         .as_deref()
@@ -31,47 +38,69 @@ pub async fn write_image(os: OsListItem, drive: Drive, tx: mpsc::Sender<AppMessa
         .send(AppMessage::WriteStatus("Starting download...".to_string()))
         .await;
 
-    // Start Download
-    let client = Client::builder()
-        .user_agent("rpi-imager-tui/0.1")
-        .build()
-        .unwrap_or_else(|_| Client::new());
+    // Start Download or Open Local File
+    let (reader, _total_size): (Box<dyn AsyncRead + Unpin + Send>, Option<u64>) =
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let client = Client::builder()
+                .user_agent("rpi-imager-tui/0.1")
+                .build()
+                .unwrap_or_else(|_| Client::new());
 
-    let res = client
-        .get(url)
-        .send()
-        .await
-        .context(format!("Failed to download from {}", url))?;
+            let res = client
+                .get(url)
+                .send()
+                .await
+                .context(format!("Failed to download from {}", url))?;
 
-    if !res.status().is_success() {
-        return Err(anyhow!("Download failed with status: {}", res.status()));
-    }
+            if !res.status().is_success() {
+                return Err(anyhow!("Download failed with status: {}", res.status()));
+            }
 
-    // Convert reqwest stream to AsyncRead
-    let stream = res
-        .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-    let stream_reader = StreamReader::new(stream);
-    let buf_reader = BufReader::with_capacity(1024 * 1024, stream_reader);
+            let size = res.content_length();
 
-    let url_parsed = reqwest::Url::parse(url)
-        .unwrap_or_else(|_| reqwest::Url::parse(&format!("http://dummy/{}", url)).unwrap());
-    let path = url_parsed.path();
+            // Convert reqwest stream to AsyncRead
+            let stream = res
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            let stream_reader = StreamReader::new(stream);
+            (
+                Box::new(BufReader::with_capacity(1024 * 1024, stream_reader)),
+                size,
+            )
+        } else {
+            let f = tokio::fs::File::open(url)
+                .await
+                .context(format!("Failed to open local file {}", url))?;
+            let metadata = f.metadata().await?;
+            (
+                Box::new(BufReader::with_capacity(1024 * 1024, f)),
+                Some(metadata.len()),
+            )
+        };
 
-    // Determine compression type from URL and setup decoder
+    let path = if url.starts_with("http") {
+        reqwest::Url::parse(url)
+            .unwrap_or_else(|_| reqwest::Url::parse(&format!("http://dummy/{}", url)).unwrap())
+            .path()
+            .to_string()
+    } else {
+        url.to_string()
+    };
+
+    // Determine compression type from URL/Path and setup decoder
     let mut decoder: Box<dyn AsyncRead + Unpin + Send> = if path.ends_with(".xz") {
-        Box::new(XzDecoder::new(buf_reader))
+        Box::new(XzDecoder::new(BufReader::new(reader)))
     } else if path.ends_with(".gz") {
-        Box::new(GzipDecoder::new(buf_reader))
+        Box::new(GzipDecoder::new(BufReader::new(reader)))
     } else if path.ends_with(".zst") {
-        Box::new(ZstdDecoder::new(buf_reader))
+        Box::new(ZstdDecoder::new(BufReader::new(reader)))
     } else if path.ends_with(".zip") {
         return Err(anyhow!(
             "ZIP files are not supported yet. Please choose an .xz, .gz, or .zst image."
         ));
     } else {
         // Assume uncompressed if no known extension match
-        Box::new(buf_reader)
+        reader
     };
 
     // Open target device for writing
@@ -257,6 +286,23 @@ pub async fn write_image(os: OsListItem, drive: Drive, tx: mpsc::Sender<AppMessa
             source_hash_hex,
             on_disk_hash_hex
         ));
+    }
+
+    // Apply Customization (if any)
+    if options.needs_customization() {
+        let _ = tx
+            .send(AppMessage::WriteStatus(
+                "Applying customization options...".to_string(),
+            ))
+            .await;
+
+        let drive_name = drive.name.clone();
+        let options_clone = options.clone();
+
+        // Run blocking mount/io operations in a separate thread
+        tokio::task::spawn_blocking(move || apply_customization(&drive_name, &options_clone))
+            .await
+            .context("Failed to join customization task")??;
     }
 
     // Send completion
