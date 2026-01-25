@@ -225,7 +225,7 @@ impl CustomizationOptions {
         if self.locale != "en_GB.UTF-8" {
             // Uncomment the locale in /etc/locale.gen
             script.push_str(&format!(
-                "sed -i 's/^# *{} /{}/' /etc/locale.gen\n",
+                "sed -i 's/^# *{} /{} /' /etc/locale.gen\n",
                 regex_escape(&self.locale),
                 self.locale
             ));
