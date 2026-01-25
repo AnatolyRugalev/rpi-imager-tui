@@ -2,6 +2,7 @@ mod customization;
 mod drivelist;
 mod os_list;
 mod post_process;
+mod static_data;
 mod worker;
 mod writer;
 
@@ -19,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
 };
 use reqwest::Client;
 use tokio::io::AsyncBufReadExt;
@@ -61,6 +62,13 @@ enum CurrentView {
     Finished,
 }
 
+enum PopupType {
+    Timezone,
+    Keyboard,
+    Locale,
+    SshKey,
+}
+
 struct App {
     pub os_list: Option<OsList>,
     pub is_loading: bool,
@@ -94,6 +102,12 @@ struct App {
     pub selected_device: Option<Device>,
     pub device_list_state: ListState,
     pub debug_mode: bool,
+
+    // Popup
+    pub popup: Option<PopupType>,
+    pub popup_list_state: ListState,
+    pub popup_items: Vec<String>,
+    pub popup_filter: String,
 }
 
 impl App {
@@ -128,6 +142,10 @@ impl App {
             selected_device: None,
             device_list_state: ListState::default(),
             debug_mode,
+            popup: None,
+            popup_list_state: ListState::default(),
+            popup_items: Vec::new(),
+            popup_filter: String::new(),
         }
     }
 
@@ -155,9 +173,9 @@ impl App {
             },
             1 => match sub_idx {
                 // Localization
-                0 => self.start_editing(self.customization_options.timezone.clone()),
-                1 => self.start_editing(self.customization_options.keyboard_layout.clone()),
-                2 => self.start_editing(self.customization_options.locale.clone()),
+                0 => self.open_popup(PopupType::Timezone),
+                1 => self.open_popup(PopupType::Keyboard),
+                2 => self.open_popup(PopupType::Locale),
                 _ => {}
             },
             2 => match sub_idx {
@@ -189,7 +207,7 @@ impl App {
                     self.customization_options.ssh_password_auth =
                         !self.customization_options.ssh_password_auth
                 }
-                2 => self.start_editing(self.customization_options.ssh_public_keys.clone()),
+                2 => self.open_popup(PopupType::SshKey),
                 _ => {}
             },
             5 => {
@@ -204,6 +222,126 @@ impl App {
     fn start_editing(&mut self, current_value: String) {
         self.customization_ui.input_buffer = current_value;
         self.customization_ui.input_mode = InputMode::Editing;
+    }
+
+    fn open_popup(&mut self, popup_type: PopupType) {
+        self.popup = Some(popup_type);
+        self.popup_filter.clear();
+        self.popup_list_state.select(Some(0));
+        self.update_popup_items();
+    }
+
+    fn update_popup_items(&mut self) {
+        if let Some(popup_type) = &self.popup {
+            let filter = self.popup_filter.to_lowercase();
+            match popup_type {
+                PopupType::Timezone => {
+                    self.popup_items = crate::static_data::get_timezones()
+                        .into_iter()
+                        .filter(|tz| tz.to_lowercase().contains(&filter))
+                        .map(|s| s.to_string())
+                        .collect();
+                }
+                PopupType::Keyboard => {
+                    self.popup_items = crate::static_data::get_keyboards()
+                        .into_iter()
+                        .filter(|(code, name)| {
+                            code.to_lowercase().contains(&filter)
+                                || name.to_lowercase().contains(&filter)
+                        })
+                        .map(|(code, name)| format!("{} - {}", code, name))
+                        .collect();
+                }
+                PopupType::Locale => {
+                    self.popup_items = crate::static_data::get_locales()
+                        .into_iter()
+                        .filter(|l| l.to_lowercase().contains(&filter))
+                        .map(|s| s.to_string())
+                        .collect();
+                }
+                PopupType::SshKey => {
+                    let keys = crate::customization::discover_ssh_keys();
+                    // Just show the whole key? They are long. Show comment if possible?
+                    // ssh keys format: "ssh-rsa AAAA... comment"
+                    // We can filter by the whole line.
+                    self.popup_items = keys
+                        .into_iter()
+                        .filter(|k| k.to_lowercase().contains(&filter))
+                        .collect();
+                    self.popup_items.insert(0, "<Enter Manually>".to_string());
+                }
+            }
+            if self.popup_items.is_empty() {
+                self.popup_list_state.select(None);
+            } else {
+                self.popup_list_state.select(Some(0));
+            }
+        }
+    }
+
+    fn popup_next(&mut self) {
+        if self.popup_items.is_empty() {
+            return;
+        }
+        let i = match self.popup_list_state.selected() {
+            Some(i) => {
+                if i >= self.popup_items.len().saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.popup_list_state.select(Some(i));
+    }
+
+    fn popup_previous(&mut self) {
+        if self.popup_items.is_empty() {
+            return;
+        }
+        let i = match self.popup_list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.popup_items.len().saturating_sub(1)
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.popup_list_state.select(Some(i));
+    }
+
+    fn popup_select(&mut self) {
+        if let (Some(i), Some(popup_type)) = (self.popup_list_state.selected(), &self.popup) {
+            if let Some(selection) = self.popup_items.get(i) {
+                match popup_type {
+                    PopupType::Timezone => {
+                        self.customization_options.timezone = selection.clone();
+                    }
+                    PopupType::Keyboard => {
+                        // Format: "gb - United Kingdom"
+                        if let Some(code) = selection.split(" - ").next() {
+                            self.customization_options.keyboard_layout = code.to_string();
+                        }
+                    }
+                    PopupType::Locale => {
+                        self.customization_options.locale = selection.clone();
+                    }
+                    PopupType::SshKey => {
+                        if selection == "<Enter Manually>" {
+                            self.popup = None;
+                            self.start_editing(self.customization_options.ssh_public_keys.clone());
+                            return;
+                        }
+                        self.customization_options.ssh_public_keys = selection.clone();
+                    }
+                }
+                self.customization_options.save();
+            }
+        }
+        self.popup = None;
     }
 
     fn apply_customization_edit(&mut self) {
@@ -759,6 +897,26 @@ async fn run_app<B: Backend + std::io::Write>(
                         app.error_message = None;
                         continue;
                     }
+
+                    if app.popup.is_some() {
+                        match key.code {
+                            KeyCode::Esc => app.popup = None,
+                            KeyCode::Enter => app.popup_select(),
+                            KeyCode::Up => app.popup_previous(),
+                            KeyCode::Down => app.popup_next(),
+                            KeyCode::Char(c) => {
+                                app.popup_filter.push(c);
+                                app.update_popup_items();
+                            }
+                            KeyCode::Backspace => {
+                                app.popup_filter.pop();
+                                app.update_popup_items();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match app.current_view {
                         CurrentView::DeviceSelection => match key.code {
                             KeyCode::Char('q') => app.should_quit = true,
@@ -1727,4 +1885,70 @@ fn ui(f: &mut Frame, app: &mut App) {
             f.render_widget(p, horizontal_layout[1]);
         }
     }
+
+    if let Some(popup_type) = &app.popup {
+        let title = match popup_type {
+            PopupType::Timezone => "Select Timezone",
+            PopupType::Keyboard => "Select Keyboard Layout",
+            PopupType::Locale => "Select Locale",
+            PopupType::SshKey => "Select SSH Key",
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_bottom(format!("Filter: {}", app.popup_filter))
+            .style(Style::default().fg(Color::Yellow));
+
+        let area = centered_rect(60, 60, f.area());
+        f.render_widget(Clear, area); // Clear background
+
+        let items: Vec<ListItem> = app
+            .popup_items
+            .iter()
+            .map(|i| ListItem::new(Line::from(i.as_str())))
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+
+        f.render_stateful_widget(list, area, &mut app.popup_list_state);
+    }
+}
+
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_y) / 2),
+                Constraint::Percentage(percent_y),
+                Constraint::Percentage((100 - percent_y) / 2),
+            ]
+            .as_ref(),
+        )
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage((100 - percent_x) / 2),
+                Constraint::Percentage(percent_x),
+                Constraint::Percentage((100 - percent_x) / 2),
+            ]
+            .as_ref(),
+        )
+        .split(popup_layout[1])[1]
 }

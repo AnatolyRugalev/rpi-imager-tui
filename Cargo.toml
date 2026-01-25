@@ -10,6 +10,7 @@ base64 = "0.22.1"
 bytes = "1.11.0"
 crossterm = "0.29.0"
 futures = "0.3.31"
+glob = "0.3.3"
 hex = "0.4.3"
 nix = { version = "0.31.1", features = ["user"] }
 pwhash = "1.0.0"

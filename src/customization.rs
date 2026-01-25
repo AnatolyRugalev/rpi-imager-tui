@@ -1,4 +1,6 @@
+use glob::glob;
 use serde::{Deserialize, Serialize};
+use std::io::BufRead;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomizationOptions {
@@ -380,4 +382,39 @@ fn regex_escape(s: &str) -> String {
 
 fn hash_password(password: &str) -> String {
     pwhash::sha512_crypt::hash(password).unwrap_or_else(|_| "".to_string())
+}
+
+pub fn discover_ssh_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let ssh_dir = std::path::Path::new(&home).join(".ssh");
+
+    // 1. Scan for .pub files
+    let pattern = ssh_dir.join("*.pub");
+    if let Some(pattern_str) = pattern.to_str() {
+        if let Ok(paths) = glob(pattern_str) {
+            for entry in paths.filter_map(Result::ok) {
+                if let Ok(content) = std::fs::read_to_string(&entry) {
+                    keys.push(content.trim().to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Read authorized_keys
+    let auth_keys = ssh_dir.join("authorized_keys");
+    if let Ok(file) = std::fs::File::open(auth_keys) {
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().filter_map(Result::ok) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                keys.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // Deduplicate
+    keys.sort();
+    keys.dedup();
+    keys
 }
