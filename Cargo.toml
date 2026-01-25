@@ -6,10 +6,12 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 async-compression = { version = "0.4.34", features = ["tokio", "xz", "gzip", "zstd"] }
+base64 = "0.22.1"
 bytes = "1.11.0"
 crossterm = "0.29.0"
 futures = "0.3.31"
 hex = "0.4.3"
+nix = { version = "0.31.1", features = ["user"] }
 ratatui = "0.29.0"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "charset"] }
 serde = { version = "1.0.228", features = ["derive"] }

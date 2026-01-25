@@ -2,10 +2,12 @@ mod customization;
 mod drivelist;
 mod os_list;
 mod post_process;
+mod worker;
 mod writer;
 
 use std::{error::Error, io};
 
+use base64::Engine;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -20,6 +22,8 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
 use reqwest::Client;
+use tokio::io::AsyncBufReadExt;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::customization::{
@@ -113,7 +117,7 @@ impl App {
             write_phase: None,
             write_task: None,
             abort_handle: None,
-            customization_options: CustomizationOptions::default(),
+            customization_options: CustomizationOptions::load(),
             customization_ui: CustomizationUiState::default(),
             customization_menu_state: ListState::default(),
             customization_sub_menu_state: ListState::default(),
@@ -131,6 +135,7 @@ impl App {
             2 => 2, // User
             3 => 3, // Wi-Fi
             4 => 3, // Remote Access
+            5 => 1, // Reset Settings
             _ => 0,
         }
     }
@@ -184,8 +189,13 @@ impl App {
                 2 => self.start_editing(self.customization_options.ssh_public_keys.clone()),
                 _ => {}
             },
+            5 => {
+                // Reset Settings
+                self.customization_options = CustomizationOptions::default();
+            }
             _ => {}
         }
+        self.customization_options.save();
     }
 
     fn start_editing(&mut self, current_value: String) {
@@ -225,6 +235,7 @@ impl App {
             },
             _ => {}
         }
+        self.customization_options.save();
     }
 
     fn get_devices(&self) -> &[Device] {
@@ -388,18 +399,93 @@ impl App {
         self.write_progress = 0.0;
         self.verify_progress = 0.0;
         self.write_phase = Some(WritingPhase::Writing);
-        self.write_status = "Starting...".to_string();
+        self.write_status = "Requesting privileges...".to_string();
 
         if let (Some(os), Some(drive)) = (self.selected_os.clone(), self.selected_drive.clone()) {
             let options = self.customization_options.clone();
+
             let handle = tokio::spawn(async move {
-                match crate::writer::write_image(os, drive, options, tx.clone()).await {
-                    Ok(_) => {}
+                // Prepare arguments
+                let exe = std::env::current_exe().unwrap_or_else(|_| "rpi-imager-tui".into());
+
+                let options_json = serde_json::to_string(&options).unwrap_or_default();
+                let options_b64 = base64::engine::general_purpose::STANDARD.encode(options_json);
+
+                // Use pkexec for privilege elevation
+                // Fallback to sudo could be added here if pkexec is missing
+                let mut cmd = Command::new("pkexec");
+                cmd.arg(exe)
+                    .arg("--worker")
+                    .arg("--device")
+                    .arg(drive.name)
+                    .arg("--options")
+                    .arg(options_b64);
+
+                if let Some(url) = os.url {
+                    cmd.arg("--image").arg(url);
+                }
+                if let Some(hash) = os.extract_sha256 {
+                    cmd.arg("--sha256").arg(hash);
+                }
+                if let Some(size) = os.extract_size {
+                    cmd.arg("--size").arg(size.to_string());
+                }
+
+                // Setup pipes
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
                     Err(e) => {
-                        let _ = tx.send(AppMessage::WriteError(e.to_string())).await;
+                        let _ = tx
+                            .send(AppMessage::WriteError(format!(
+                                "Failed to spawn privileged process: {}",
+                                e
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let stdout = child.stdout.take().expect("Failed to open stdout");
+                let mut reader = tokio::io::BufReader::new(stdout).lines();
+
+                while let Ok(Some(line)) = reader.next_line().await {
+                    if let Ok(msg) = serde_json::from_str::<worker::WorkerMessage>(&line) {
+                        let app_msg = match msg {
+                            worker::WorkerMessage::Progress(p) => AppMessage::WriteProgress(p),
+                            worker::WorkerMessage::VerifyProgress(p) => {
+                                AppMessage::VerifyProgress(p)
+                            }
+                            worker::WorkerMessage::Status(s) => AppMessage::WriteStatus(s),
+                            worker::WorkerMessage::Phase(p) => {
+                                AppMessage::WritingPhase(match p.as_str() {
+                                    "Verifying" => WritingPhase::Verifying,
+                                    _ => WritingPhase::Writing,
+                                })
+                            }
+                            worker::WorkerMessage::Error(e) => AppMessage::WriteError(e),
+                            worker::WorkerMessage::Finished => AppMessage::WriteFinished,
+                        };
+                        let _ = tx.send(app_msg).await;
+                    }
+                }
+
+                // Check exit status
+                if let Ok(status) = child.wait().await {
+                    if !status.success() {
+                        // If we haven't received a more specific error
+                        let _ = tx
+                            .send(AppMessage::WriteError(format!(
+                                "Worker process exited with code {}",
+                                status.code().unwrap_or(-1)
+                            )))
+                            .await;
                     }
                 }
             });
+
             self.abort_handle = Some(handle.abort_handle());
             self.write_task = Some(handle);
         }
@@ -434,6 +520,22 @@ impl App {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Worker Mode
+    if args.iter().any(|a| a == "--worker") {
+        worker::run_worker(args).await;
+        return Ok(());
+    }
+
+    // Check for root (prevent running as root)
+    if nix::unistd::Uid::effective().is_root() {
+        eprintln!(
+            "Error: Please run as a normal user. The application will request privileges when needed."
+        );
+        std::process::exit(1);
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -445,7 +547,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
 
     // Check for local image argument
-    let args: Vec<String> = std::env::args().collect();
     for arg in args.iter().skip(1) {
         if !arg.starts_with("--") {
             // Assume this is an image path
@@ -725,7 +826,7 @@ async fn run_app<B: Backend>(
                                     KeyCode::Down => {
                                         let i = match app.customization_menu_state.selected() {
                                             Some(i) => {
-                                                if i >= 5 {
+                                                if i >= 6 {
                                                     0
                                                 } else {
                                                     i + 1
@@ -739,7 +840,7 @@ async fn run_app<B: Backend>(
                                         let i = match app.customization_menu_state.selected() {
                                             Some(i) => {
                                                 if i == 0 {
-                                                    5
+                                                    6
                                                 } else {
                                                     i - 1
                                                 }
@@ -749,7 +850,7 @@ async fn run_app<B: Backend>(
                                         app.customization_menu_state.select(Some(i));
                                     }
                                     KeyCode::Enter | KeyCode::Right => {
-                                        if let Some(5) = app.customization_menu_state.selected() {
+                                        if let Some(6) = app.customization_menu_state.selected() {
                                             // NEXT selected
                                             app.current_view = CurrentView::WriteConfirmation;
                                         } else {
@@ -1139,6 +1240,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 "User",
                 "Wi-Fi",
                 "Remote Access",
+                "Reset Settings",
                 "NEXT >",
             ];
             let menu_items: Vec<ListItem> = menu_items_labels
@@ -1213,6 +1315,10 @@ fn ui(f: &mut Frame, app: &mut App) {
                     items.push(format!("Public Key: {}", opts.ssh_public_keys));
                 }
                 5 => {
+                    // Reset
+                    items.push("Press Enter to reset all settings to defaults.".to_string());
+                }
+                6 => {
                     // Next
                     items.push("Press Enter to proceed to writing.".to_string());
                 }

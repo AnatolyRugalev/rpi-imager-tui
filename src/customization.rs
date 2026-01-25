@@ -101,8 +101,40 @@ impl Default for CustomizationUiState {
     }
 }
 
-// Placeholder for future generator logic
 impl CustomizationOptions {
+    pub fn config_path() -> Option<std::path::PathBuf> {
+        if let Ok(home) = std::env::var("HOME") {
+            let path = std::path::Path::new(&home).join(".config/rpi-imager-tui/config.json");
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    pub fn load() -> Self {
+        if let Some(path) = Self::config_path() {
+            if path.exists() {
+                if let Ok(file) = std::fs::File::open(path) {
+                    if let Ok(opts) = serde_json::from_reader(file) {
+                        return opts;
+                    }
+                }
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self) {
+        if let Some(path) = Self::config_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(file) = std::fs::File::create(path) {
+                let _ = serde_json::to_writer_pretty(file, self);
+            }
+        }
+    }
+
     pub fn needs_customization(&self) -> bool {
         // Check if any option is non-default
         self.hostname != "raspberrypi"
